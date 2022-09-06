@@ -1,0 +1,133 @@
+app: lomond
+service: lomond-ingress-talentlms
+
+custom:
+  # When using scheduleEnabled, please default to `false` for any undefined
+  # schedules, e.g.: ${self:custom.scheduleEnabled.${sls:stage}, false}
+  scheduleEnabled:
+    dev: false
+    prod: true
+
+# Read .env files into the environment and don't package them
+useDotenv: true
+
+package:
+  exclude:
+    - ".*/**"
+    - "env/**"
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  region: eu-central-1
+  runtime: python3.9
+  stage: ${opt:stage, "dev"}
+  memorySize: 128 # MB
+  timeout: 32 # Seconds
+  environment:
+    # Ideally we'd use !GetAtt Firehose.DeliveryStreamName 
+    # But the DeliveryStreamName isn't a readonly attribute
+    ERROR_STREAM_NAME: ${file(../../shared-variables.yml):errorStreamName}
+    LAKE_STREAM_NAME: ${file(../../shared-variables.yml):lakeStreamName}
+    SQS_QUEUE_URL: !Ref TalentLMSGetQueue
+    TALENTLMS_API_KEY: ${env:TALENTLMS_API_KEY}
+      
+  iam:
+    role:
+      statements:
+        - ${file(../../shared-variables.yml):lomondFirehosesAllowStatement}
+        - Effect: Allow
+          Action:
+            - sqs:*
+          Resource:
+            - !GetAtt TalentLMSGetQueue.Arn
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource:
+            - !Sub ${TalentLMSDropBucket.Arn}
+            - !Sub ${TalentLMSDropBucket.Arn}/*
+
+
+functions:
+  get-queue-initiator:
+    name: talentlms-get-queue-initiator-${sls:stage}
+    handler: talentlms.functions.get_queue_initiator
+    events:
+      - schedule:
+          rate: rate(60 minutes)
+          enabled: ${self:custom.scheduleEnabled.${sls:stage}}
+  get-queue-handler:
+    name: talentlms-get-queue-handler-${sls:stage}
+    handler: talentlms.functions.get_queue_handler
+    events:
+      - sqs:
+          arn: !GetAtt TalentLMSGetQueue.Arn
+          batchSize: 1
+  dropbucket-timeline-export-handler:
+    name: talentlms-dropbucket-timeline-export-handler-${sls:stage}
+    handler: talentlms.functions.dropbucket_timeline_export_handler
+    timeout: 64 # Seconds
+    events:
+      - s3:
+          bucket: !Ref TalentLMSDropBucket
+          existing: true
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: timeline-export/
+            - suffix: .csv
+
+resources:
+  Resources:
+    TalentLMSDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: lomond-ingress-talentlms-dlq-${sls:stage}.fifo
+        # DLQ for a FIFO queue must be a FIFO queue
+        FifoQueue: true
+        # TODO: This would be convenient but it causes a circular dependency.
+        # RedriveAllowPolicy:
+        #   redrivePermission: byQueue
+        #   sourceQueueArns:
+        #     - !GetAtt TalentLMSGetQueue.Arn
+    TalentLMSGetQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: lomond-ingress-talentlms-get-queue-${sls:stage}.fifo
+        # How long other components should be blocked from receiving the same
+        # message. This is set to 6 times the timeout for an individual lambda so
+        # that we have time for retries.
+        VisibilityTimeout: 192
+        FifoQueue: true
+        FifoThroughputLimit: perMessageGroupId
+        # Required to set this for FIFO queues
+        DeduplicationScope: messageGroup
+        ContentBasedDeduplication: true
+        RedrivePolicy: 
+          deadLetterTargetArn: !GetAtt TalentLMSDeadLetterQueue.Arn
+          maxReceiveCount: 3
+    TalentLMSDropBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        AccessControl: Private
+        BucketEncryption: 
+          ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              # Hardcode this reference so that deleting the key always has to be
+              # done manually. There is usually no reason to remove it across
+              # redeploys. Rotations are managed.
+              KMSMasterKeyID: arn:aws:kms:eu-central-1:716661261295:key/f5d914d9-4e91-4c9b-a71f-d293f230e24a
+            # Extra intermediate key that reduces calls to KMS.
+            BucketKeyEnabled: true
+        BucketName: wincacademy-lomond-talentlms-dropbucket-${sls:stage}
+        # Fully restrict public access
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+plugins:
+  - serverless-python-requirements
